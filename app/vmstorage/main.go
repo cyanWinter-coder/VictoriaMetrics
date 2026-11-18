@@ -74,6 +74,12 @@ var (
 		"Excess series are logged and dropped. This can be useful for limiting series churn rate. See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#cardinality-limiter . "+
 		fmt.Sprintf("Setting this flag to '-1' sets limit to maximum possible value (%d) which is useful in order to enable series tracking without enforcing limits. ", math.MaxInt32)+
 		"See also -storage.maxHourlySeries")
+	maxSeriesPerMetricGroup = flag.Int("storage.maxSeriesPerMetricGroup", 0, "The maximum number of new series, which can be registered "+
+		"per metric group (metric name) during the last hour. Excess series are logged and dropped, while already registered series "+
+		"continue accepting samples. This can be useful for protecting the inverted index from unbounded growth when a metric contains "+
+		"a label with unbounded set of values (aka high-cardinality label such as user_id or request_id). "+
+		"See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#cardinality-limiter . "+
+		"See also -storage.maxHourlySeries and -storage.maxDailySeries")
 
 	minFreeDiskSpaceBytes = flagutil.NewBytes("storage.minFreeDiskSpaceBytes", 100e6, "The minimum free disk space at -storageDataPath after which the storage stops accepting new data")
 
@@ -159,6 +165,7 @@ func Init(vmselectMaxConcurrentRequests int, vmselectMaxQueueDuration time.Durat
 		DenyQueriesOutsideRetention: *denyQueriesOutsideRetention,
 		MaxHourlySeries:             getMaxHourlySeries(),
 		MaxDailySeries:              getMaxDailySeries(),
+		MaxSeriesPerMetricGroup:     *maxSeriesPerMetricGroup,
 		DisablePerDayIndex:          *disablePerDayIndex,
 		TrackMetricNamesStats:       *trackMetricNamesStats,
 		IDBPrefillStart:             *idbPrefillStart,
@@ -495,6 +502,10 @@ func (vms *VMStorage) writeStorageMetrics(w io.Writer) {
 	}
 	if getMaxDailySeries() > 0 {
 		metrics.WriteCounterUint64(w, `vm_rows_ignored_total{reason="daily_limit_exceeded"}`, m.DailySeriesLimitRowsDropped)
+	}
+	if *maxSeriesPerMetricGroup > 0 {
+		metrics.WriteCounterUint64(w, `vm_rows_ignored_total{reason="per_group_series_limit_exceeded"}`, m.PerGroupSeriesLimitRowsDropped)
+		metrics.WriteCounterUint64(w, `vm_per_group_series_limit_rows_dropped_total`, m.PerGroupSeriesLimitRowsDropped)
 	}
 
 	metrics.WriteCounterUint64(w, `vm_timeseries_repopulated_total`, m.TimeseriesRepopulated)

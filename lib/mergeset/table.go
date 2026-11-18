@@ -3,6 +3,7 @@ package mergeset
 import (
 	"encoding/json"
 	"errors"
+	"flag"
 	"fmt"
 	"math"
 	"os"
@@ -31,7 +32,23 @@ import (
 // This number may be reached when the insertion pace outreaches merger pace.
 // If this number is reached, then the data ingestion is paused until background
 // mergers reduce the number of parts below this number.
-const maxInmemoryParts = 30
+//
+// Lower values reduce memory usage at the cost of higher CPU usage and slower
+// data ingestion under burst writes. Higher values improve ingestion throughput
+// at the cost of higher memory usage.
+var maxInmemoryParts = flag.Int("mergeset.maxInmemoryParts", 30, "The maximum number of inmemory parts in the table. "+
+	"When the number of inmemory parts reaches this limit, the data ingestion is paused until background mergers "+
+	"reduce the number of parts below the limit. Lower values reduce memory usage at the cost of higher CPU usage "+
+	"and slower data ingestion under burst writes")
+
+// getMaxInmemoryParts returns the maximum number of inmemory parts in the table.
+//
+// The returned value is always bigger than zero in order to protect from
+// misconfiguration, which may result in division by zero or in a deadlock
+// during data ingestion.
+func getMaxInmemoryParts() int {
+	return max(*maxInmemoryParts, 1)
+}
 
 // Default number of parts to merge at once.
 //
@@ -376,7 +393,7 @@ func MustOpenTable(path string, flushInterval time.Duration, flushCallback func(
 		prepareBlock:          prepareBlock,
 		isReadOnly:            isReadOnly,
 		fileParts:             pws,
-		inmemoryPartsLimitCh:  make(chan struct{}, maxInmemoryParts),
+		inmemoryPartsLimitCh:  make(chan struct{}, getMaxInmemoryParts()),
 		stopCh:                make(chan struct{}),
 	}
 	tb.mergeIdx.Store(uint64(time.Now().UnixNano()))
@@ -1069,7 +1086,7 @@ func newPartWrapperFromInmemoryPart(mp *inmemoryPart, flushToDiskDeadline time.T
 
 func getMaxInmemoryPartSize() uint64 {
 	// Allow up to 5% of memory for in-memory parts.
-	n := max(uint64(0.05*float64(memory.Allowed())/maxInmemoryParts), 1e6)
+	n := max(uint64(0.05*float64(memory.Allowed())/float64(getMaxInmemoryParts())), 1e6)
 	return n
 }
 

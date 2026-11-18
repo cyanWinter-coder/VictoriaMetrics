@@ -17,6 +17,16 @@ import (
 var missesBeforeCaching = flag.Int("blockcache.missesBeforeCaching", 2, "The number of cache misses before putting the block into cache. "+
 	"Higher values may reduce indexdb/dataBlocks cache size at the cost of higher CPU and disk read usage")
 
+// maxPerKeyMissesEntriesTotal is the maximum total number of entries in perKeyMisses
+// maps across all the cache shards.
+//
+// The perKeyMisses map is reset every few minutes by the cleaner, but high-cardinality
+// queries touching millions of distinct blocks within this interval could grow the map
+// without bounds. The cap below puts a hard limit on the memory occupied by the map.
+// When the per-shard limit is reached, the map is reset, which has the same effect
+// as the periodic cleanup performed by cleanPerKeyMisses().
+const maxPerKeyMissesEntriesTotal = 1 << 20
+
 // Cache caches Block entries.
 //
 // Call NewCache() for creating new Cache.
@@ -43,8 +53,9 @@ func NewCache(getMaxSizeBytes func() int) *Cache {
 		n := getMaxSizeBytes()
 		return n / shardsCount
 	}
+	maxPerKeyMissesEntries := max(maxPerKeyMissesEntriesTotal/shardsCount, 1024)
 	for i := range shards {
-		shards[i] = newCache(getMaxShardBytes)
+		shards[i] = newCache(getMaxShardBytes, maxPerKeyMissesEntries)
 	}
 	c := &Cache{
 		shards:            shards,
@@ -137,6 +148,28 @@ func (c *Cache) Misses() uint64 {
 	return n
 }
 
+// PerKeyMissesLen returns the total number of entries in per-key misses maps across all the shards.
+//
+// This value is useful for detecting high-cardinality query patterns, which
+// may put memory pressure on the cache.
+func (c *Cache) PerKeyMissesLen() int {
+	n := 0
+	for _, shard := range c.shards {
+		n += shard.PerKeyMissesLen()
+	}
+	return n
+}
+
+// PerKeyMissesResets returns the number of times per-key misses maps were reset
+// because they exceeded the maximum allowed size.
+func (c *Cache) PerKeyMissesResets() uint64 {
+	n := uint64(0)
+	for _, shard := range c.shards {
+		n += shard.PerKeyMissesResets()
+	}
+	return n
+}
+
 func (c *Cache) cleaner() {
 	d := timeutil.AddJitterToDuration(time.Minute)
 	ticker := time.NewTicker(d)
@@ -174,11 +207,19 @@ type cache struct {
 	requests atomic.Uint64
 	misses   atomic.Uint64
 
+	// perKeyMissesResets is the number of times the perKeyMisses map was reset
+	// after exceeding maxPerKeyMissesEntries.
+	perKeyMissesResets atomic.Uint64
+
 	// sizeBytes contains an approximate size for all the blocks stored in the cache.
 	sizeBytes atomic.Int64
 
 	// getMaxSizeBytes() is a callback, which returns the maximum allowed cache size in bytes.
 	getMaxSizeBytes func() int
+
+	// maxPerKeyMissesEntries is the maximum number of entries in perKeyMisses map.
+	// The map is reset when this limit is exceeded.
+	maxPerKeyMissesEntries int
 
 	// mu protects all the fields below.
 	mu sync.Mutex
@@ -229,9 +270,10 @@ type cacheEntry struct {
 	b Block
 }
 
-func newCache(getMaxSizeBytes func() int) *cache {
+func newCache(getMaxSizeBytes func() int, maxPerKeyMissesEntries int) *cache {
 	var c cache
 	c.getMaxSizeBytes = getMaxSizeBytes
+	c.maxPerKeyMissesEntries = maxPerKeyMissesEntries
 	c.m = make(map[any]map[uint64]*cacheEntry)
 	c.perKeyMisses = make(map[Key]int)
 	return &c
@@ -296,6 +338,14 @@ func (c *cache) GetBlock(k Key) Block {
 		}
 	}
 	// Slow path - the entry is missing in the cache.
+	if len(c.perKeyMisses) >= c.maxPerKeyMissesEntries {
+		// The perKeyMisses map grew too big, e.g. because of high-cardinality
+		// queries touching too many distinct blocks. Reset it in order to put
+		// a hard limit on its memory usage. This has the same effect as the
+		// periodic cleanup performed by cleanPerKeyMisses().
+		c.perKeyMisses = make(map[Key]int, c.maxPerKeyMissesEntries)
+		c.perKeyMissesResets.Add(1)
+	}
 	c.perKeyMisses[k]++
 	c.misses.Add(1)
 	return nil
@@ -380,6 +430,20 @@ func (c *cache) Requests() uint64 {
 
 func (c *cache) Misses() uint64 {
 	return c.misses.Load()
+}
+
+// PerKeyMissesLen returns the number of entries in the per-key misses map.
+func (c *cache) PerKeyMissesLen() int {
+	c.mu.Lock()
+	n := len(c.perKeyMisses)
+	c.mu.Unlock()
+	return n
+}
+
+// PerKeyMissesResets returns the number of times the per-key misses map was reset
+// after exceeding the maximum allowed size.
+func (c *cache) PerKeyMissesResets() uint64 {
+	return c.perKeyMissesResets.Load()
 }
 
 // lastAccessHeap implements heap.Interface

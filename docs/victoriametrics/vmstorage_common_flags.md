@@ -159,6 +159,8 @@ See the docs at https://docs.victoriametrics.com/victoriametrics/cluster-victori
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 0)
   -memory.allowedPercent float
      Allowed percent of system memory VictoriaMetrics caches may occupy. See also -memory.allowedBytes. Too low a value may increase cache miss rate usually resulting in higher CPU and disk IO usage. Too high a value may evict too much data from the OS page cache which will result in higher disk IO usage (default 60)
+  -mergeset.maxInmemoryParts int
+     The maximum number of inmemory parts in the table. When the number of inmemory parts reaches this limit, the data ingestion is paused until background mergers reduce the number of parts below the limit. Lower values reduce memory usage at the cost of higher CPU usage and slower data ingestion under burst writes (default 30)
   -metrics.exposeMetadata
      Whether to expose TYPE and HELP metadata at the /metrics page, which is exposed at -httpListenAddr . The metadata may be needed when the /metrics page is consumed by systems, which require this information. For example, Managed Prometheus in Google Cloud - https://cloud.google.com/stackdriver/docs/managed-prometheus/troubleshooting#missing-metric-type
   -metricsAuthKey value
@@ -259,6 +261,8 @@ See the docs at https://docs.victoriametrics.com/victoriametrics/cluster-victori
   -storage.maxMetadataStorageSize size
      Overrides max size for metrics metadata entries in-memory storage. If set to 0 or a negative value, defaults to 1% of allowed memory.
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 0)
+  -storage.maxSeriesPerMetricGroup int
+     The maximum number of new series, which can be registered per metric group (metric name) during the last hour. Excess series are logged and dropped, while already registered series continue accepting samples. This can be useful for protecting the inverted index from unbounded growth when a metric contains a label with unbounded set of values (aka high-cardinality label such as user_id or request_id). See https://docs.victoriametrics.com/victoriametrics/single-server-victoriametrics/#cardinality-limiter . See also -storage.maxHourlySeries and -storage.maxDailySeries
   -storage.minFreeDiskSpaceBytes size
      The minimum free disk space at -storageDataPath after which the storage stops accepting new data
      Supports the following optional suffixes for size values: KB, MB, GB, TB, KiB, MiB, GiB, TiB (default 100000000)

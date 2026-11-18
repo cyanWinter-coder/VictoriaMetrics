@@ -164,3 +164,65 @@ type testBlock struct{}
 func (tb *testBlock) SizeBytes() int {
 	return 42
 }
+
+func TestCachePerKeyMissesLimit(t *testing.T) {
+	const sizeMaxBytes = 16 * 1024 * 1024
+	getMaxSize := func() int {
+		return sizeMaxBytes
+	}
+	c := NewCache(getMaxSize)
+	defer c.MustStop()
+
+	// Shrink the per-shard perKeyMisses limit in order to avoid
+	// generating too many misses in the test.
+	const maxMisses = 128
+	for _, shard := range c.shards {
+		shard.maxPerKeyMissesEntries = maxMisses
+	}
+
+	// Generate cache misses for distinct keys. The number of misses exceeds
+	// the total perKeyMisses capacity across all the shards, so the maps
+	// must be reset at least once instead of growing without bounds.
+	totalMisses := 10 * maxMisses * len(c.shards)
+	part := (any)("some-part")
+	for i := range totalMisses {
+		k := Key{
+			Offset: uint64(i),
+			Part:   part,
+		}
+		if b := c.GetBlock(k); b != nil {
+			t.Fatalf("unexpected non-nil block obtained for non-existing key: %v", b)
+		}
+	}
+	if n := c.Misses(); n != uint64(totalMisses) {
+		t.Fatalf("unexpected number of misses; got %d; want %d", n, totalMisses)
+	}
+	if n := c.PerKeyMissesResets(); n == 0 {
+		t.Fatalf("expecting at least one perKeyMisses reset; got %d", n)
+	}
+	if n := c.PerKeyMissesLen(); n > maxPerKeyMissesLen(c) {
+		t.Fatalf("perKeyMisses length exceeds the configured limit; got %d", n)
+	}
+
+	// The cache must remain functional after the resets: blocks must be cached
+	// once the number of misses for the key exceeds missesBeforeCaching.
+	k := Key{Offset: 1, Part: part}
+	for range *missesBeforeCaching + 1 {
+		c.GetBlock(k)
+	}
+	var b testBlock
+	if !c.TryPutBlock(k, &b) {
+		t.Fatalf("the block must be put into the cache after %d misses", *missesBeforeCaching)
+	}
+	if b1 := c.GetBlock(k); b1 != &b {
+		t.Fatalf("unexpected block obtained; got %v; want %v", b1, &b)
+	}
+}
+
+func maxPerKeyMissesLen(c *Cache) int {
+	n := 0
+	for _, shard := range c.shards {
+		n += shard.maxPerKeyMissesEntries
+	}
+	return n
+}

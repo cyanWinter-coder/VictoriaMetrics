@@ -1181,6 +1181,11 @@ By default, VictoriaMetrics is tuned for an optimal resource usage under typical
 * `-maxIngestionRate` limits samples/second ingested. This may be useful when CPU resources are limited or overloaded.
 * `-memory.allowedPercent` and `-memory.allowedBytes` limit the amounts of memory, which may be used for various internal caches at VictoriaMetrics.
   Note that VictoriaMetrics may use more memory, since these flags don't limit additional memory, which may be needed on a per-query basis.
+* `-mergeset.maxInmemoryParts` limits the number of in-memory parts in the indexdb. When the limit is reached, the data ingestion
+  is paused until background mergers reduce the number of parts below the limit (backpressure). Lower values reduce memory usage
+  under burst writes at the cost of higher CPU usage and slower data ingestion.
+* `-storage.maxSeriesPerMetricGroup` limits the number of new series registered per metric name during the last hour.
+  This protects the inverted index from unbounded growth caused by high-cardinality labels. See [cardinality limiter](#cardinality-limiter).
 * `-search.maxMemoryPerQuery` limits the amounts of memory, which can be used for processing a single query. Queries, which need more memory, are rejected.
   Heavy queries, which select big number of time series, may exceed the per-query memory limit by a small percent. The total memory limit
   for concurrently executed queries can be estimated as `-search.maxMemoryPerQuery` multiplied by `-search.maxConcurrentRequests`.
@@ -2207,6 +2212,12 @@ By default, VictoriaMetrics doesn't limit the number of stored time series. The 
 
 * `-storage.maxHourlySeries` - limits the number of time series that can be added during the last hour. Useful for limiting the number of [active time series](https://docs.victoriametrics.com/victoriametrics/faq/#what-is-an-active-time-series).
 * `-storage.maxDailySeries` - limits the number of time series that can be added during the last day. Useful for limiting daily [churn rate](https://docs.victoriametrics.com/victoriametrics/faq/#what-is-high-churn-rate).
+* `-storage.maxSeriesPerMetricGroup` - limits the number of new time series that can be registered per metric group (metric name) during the last hour.
+  Useful for protecting the inverted index from unbounded growth when a metric contains a label with unbounded set of values
+  (aka high-cardinality label such as `user_id` or `request_id`). Unlike `-storage.maxHourlySeries` and `-storage.maxDailySeries`,
+  this limit is applied only to genuinely new series - already registered series continue accepting samples after the limit is reached.
+  The limiter keeps exact per-group counters in memory; the memory usage is bounded because the number of tracked metric groups
+  is limited to 100000 and the counters are reset every hour.
 
 Both limits can be set simultaneously. If any of these limits is reached, then incoming samples for new time series are dropped. A sample of dropped series is put in the log with `WARNING` level.
 
@@ -2237,7 +2248,11 @@ The exceeded limits can be [monitored](#monitoring) with the following metrics:
   vm_daily_series_limit_current_series / vm_daily_series_limit_max_series > 0.9
   ```
 
-These limits are approximate, so VictoriaMetrics can underflow/overflow the limit by a small percentage (usually less than 1%).
+* `vm_per_group_series_limit_rows_dropped_total` - the number of metrics dropped because the number of new series for their metric group
+  exceeded the `-storage.maxSeriesPerMetricGroup` limit during the last hour.
+
+The `-storage.maxHourlySeries` and `-storage.maxDailySeries` limits are approximate, so VictoriaMetrics can underflow/overflow the limit by a small percentage (usually less than 1%).
+The `-storage.maxSeriesPerMetricGroup` limit is exact, since it is tracked with per-group counters instead of bloom filters.
 
 See also:
 - [vmagent - Cardinality Limiter](https://docs.victoriametrics.com/victoriametrics/vmagent/#cardinality-limiter).
@@ -2422,6 +2437,11 @@ size may need to be increased.
 > Please note, default cache sizes were carefully adjusted accordingly to the most
 practical scenarios and workloads. Change the defaults only if you understand the implications
 and vmstorage has enough free memory to accommodate new cache sizes.
+
+The block caches (`indexdb/dataBlocks`, `indexdb/indexBlocks`, `storage/indexBlocks`) track per-block cache misses
+in order to avoid caching one-time-wonders (see `-blockcache.missesBeforeCaching`). The memory occupied by this tracking
+is bounded - the per-shard miss maps are reset when their total size exceeds 1M entries across all the shards,
+so high-cardinality queries touching millions of distinct blocks cannot grow this memory without bounds.
 
 To override the default values see command-line flag `-cacheExpireDuration` and flags with `-storage.cacheSize` prefix.
 See the full description of [command-line flags](#list-of-command-line-flags).

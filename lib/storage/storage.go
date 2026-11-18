@@ -58,6 +58,8 @@ type Storage struct {
 	hourlySeriesLimitRowsDropped atomic.Uint64
 	dailySeriesLimitRowsDropped  atomic.Uint64
 
+	perGroupSeriesLimitRowsDropped atomic.Uint64
+
 	// legacyNextRotationTimestamp is a timestamp in seconds of the next legacy
 	// indexdb rotation.
 	legacyNextRotationTimestamp atomic.Int64
@@ -88,6 +90,11 @@ type Storage struct {
 	// Series cardinality limiters.
 	hourlySeriesLimiter *bloomfilter.Limiter
 	dailySeriesLimiter  *bloomfilter.Limiter
+
+	// perGroupSeriesLimiter limits the number of new series registered
+	// per metric group (metric name) per hour. It protects the inverted
+	// index from unbounded growth caused by high-cardinality labels.
+	perGroupSeriesLimiter *metricGroupSeriesLimiter
 
 	// tsidCache is MetricName -> TSID cache.
 	tsidCache *workingsetcache.Cache
@@ -174,6 +181,12 @@ type OpenOptions struct {
 	TrackMetricNamesStats       bool
 	IDBPrefillStart             time.Duration
 	LogNewSeries                bool
+
+	// MaxSeriesPerMetricGroup limits the number of new series, which can be
+	// registered per metric group (metric name) per hour. It protects
+	// the inverted index from unbounded growth when a metric contains
+	// a label with unbounded set of values. Zero means no limit.
+	MaxSeriesPerMetricGroup int
 }
 
 // MustOpenStorage opens storage on the given path with the given retentionMsecs.
@@ -243,6 +256,9 @@ func MustOpenStorage(path string, opts OpenOptions) *Storage {
 	}
 	if opts.MaxDailySeries > 0 {
 		s.dailySeriesLimiter = bloomfilter.NewLimiter(opts.MaxDailySeries, 24*time.Hour)
+	}
+	if opts.MaxSeriesPerMetricGroup > 0 {
+		s.perGroupSeriesLimiter = newMetricGroupSeriesLimiter(opts.MaxSeriesPerMetricGroup)
 	}
 
 	// Load caches.
@@ -559,6 +575,8 @@ type Metrics struct {
 	DailySeriesLimitMaxSeries     uint64
 	DailySeriesLimitCurrentSeries uint64
 
+	PerGroupSeriesLimitRowsDropped uint64
+
 	TimestampsBlocksMerged uint64
 	TimestampsBytesSaved   uint64
 
@@ -639,6 +657,10 @@ func (s *Storage) UpdateMetrics(m *Metrics) {
 		m.DailySeriesLimitRowsDropped += s.dailySeriesLimitRowsDropped.Load()
 		m.DailySeriesLimitMaxSeries += uint64(sl.MaxItems())
 		m.DailySeriesLimitCurrentSeries += uint64(sl.CurrentItems())
+	}
+
+	if sl := s.perGroupSeriesLimiter; sl != nil {
+		m.PerGroupSeriesLimitRowsDropped += s.perGroupSeriesLimitRowsDropped.Load()
 	}
 
 	m.TimestampsBlocksMerged = timestampsBlocksMerged.Load()
@@ -1816,6 +1838,11 @@ func (s *Storage) RegisterMetricNames(qt *querytracer.Tracer, mrs []MetricRow) {
 		}
 
 		// Slowest path - there is no TSID in indexdb for the given mr.MetricNameRaw. Create it.
+		if !s.registerNewSeriesForMetricGroup(mn) {
+			// Skip the series, since the number of new series for its metric group
+			// exceeds -storage.maxSeriesPerMetricGroup during the current hour.
+			continue
+		}
 		generateTSID(&lTSID.TSID, mn)
 		createAllIndexesForMetricName(idb, mn, &lTSID.TSID, date)
 		s.putTSIDByMetricNameToCache(&lTSID, mr.MetricNameRaw)
@@ -2033,6 +2060,12 @@ func (s *Storage) add(rows []rawRow, dstMrs []*MetricRow, mrs []MetricRow, preci
 		}
 
 		// Slowest path - the TSID for the given mr.MetricNameRaw isn't found in indexdb. Create it.
+		if !s.registerNewSeriesForMetricGroup(mn) {
+			// Skip the row, since the number of new series for its metric group
+			// exceeds -storage.maxSeriesPerMetricGroup during the current hour.
+			j--
+			continue
+		}
 		generateTSID(&lTSID.TSID, mn)
 		createAllIndexesForMetricName(idb, mn, &lTSID.TSID, date)
 		s.putTSIDByMetricNameToCache(&lTSID, mr.MetricNameRaw)
@@ -2133,6 +2166,38 @@ func logSkippedSeries(metricNameRaw []byte, flagName string, flagValue int) {
 }
 
 var logSkippedSeriesTicker = time.NewTicker(5 * time.Second)
+
+// registerNewSeriesForMetricGroup registers a genuinely new series for its
+// metric group (metric name) in the per-group series limiter.
+//
+// It must be called only on the slowest add path, when the series isn't found
+// in the tsid cache and in the indexdb, e.g. when the series is new indeed.
+// This guarantees that already registered series continue accepting rows
+// after the per-group limit is reached.
+//
+// It returns false if the number of new series for the metric group of mn
+// exceeds -storage.maxSeriesPerMetricGroup during the current hour.
+func (s *Storage) registerNewSeriesForMetricGroup(mn *MetricName) bool {
+	sl := s.perGroupSeriesLimiter
+	if sl == nil {
+		return true
+	}
+	groupHash := xxhash.Sum64(mn.MetricGroup)
+	hour := uint64(fasttime.UnixHour())
+	if sl.Register(groupHash, hour) {
+		return true
+	}
+	s.perGroupSeriesLimitRowsDropped.Add(1)
+	select {
+	case <-logSkippedSeriesTicker.C:
+		// Do not use logger.WithThrottler() here, since this will result in increased CPU load
+		// because of mn.String() calls per each rejected series.
+		logger.Warnf("skip creating new series %s because the number of new series for metric group %q during the current hour exceeded -storage.maxSeriesPerMetricGroup=%d",
+			mn.String(), mn.MetricGroup, sl.MaxItems())
+	default:
+	}
+	return false
+}
 
 func getUserReadableMetricName(metricNameRaw []byte) string {
 	mn := GetMetricName()

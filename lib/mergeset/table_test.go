@@ -94,6 +94,43 @@ func testAddItemsSerial(r *rand.Rand, tb *Table, itemsCount int) {
 	}
 }
 
+func TestTableInmemoryPartsLimitBackpressure(t *testing.T) {
+	// Shrink the maximum number of inmemory parts in order to trigger
+	// the backpressure mechanism during the test.
+	origMaxInmemoryParts := *maxInmemoryParts
+	*maxInmemoryParts = 2
+	defer func() { *maxInmemoryParts = origMaxInmemoryParts }()
+
+	const path = "TestTableInmemoryPartsLimitBackpressure"
+	fs.MustRemoveDir(path)
+	defer fs.MustRemoveDir(path)
+
+	var isReadOnly atomic.Bool
+	tb := MustOpenTable(path, 0, nil, 0, nil, &isReadOnly)
+
+	// Add enough items to create multiple inmemory parts and to trigger
+	// the backpressure when their number exceeds the limit.
+	r := rand.New(rand.NewSource(1))
+	const itemsCount = 100_000
+	testAddItemsSerial(r, tb, itemsCount)
+	tb.DebugFlush()
+
+	// All the added items must remain searchable even if the backpressure
+	// mechanism has been triggered during the data ingestion.
+	var m TableMetrics
+	tb.UpdateMetrics(&m)
+	if n := m.TotalItemsCount(); n != itemsCount {
+		t.Fatalf("unexpected itemsCount; got %d; want %d", n, itemsCount)
+	}
+	if n, limit := m.InmemoryPartsCount, uint64(getMaxInmemoryParts()); n > limit {
+		t.Fatalf("the number of inmemory parts exceeds the limit; got %d; want <= %d", n, limit)
+	}
+	tb.MustClose()
+
+	// Re-open the table and make sure itemsCount remains the same.
+	testReopenTable(t, path, itemsCount)
+}
+
 func TestTableCreateSnapshotAt(t *testing.T) {
 	const path = "TestTableCreateSnapshotAt"
 	fs.MustRemoveDir(path)
